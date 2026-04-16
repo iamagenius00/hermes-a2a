@@ -1,0 +1,23 @@
+# Add this to ~/.hermes/config.yaml to configure A2A remote agents
+# (for the client tools: a2a_discover, a2a_call, a2a_list)
+
+a2a:
+  agents:
+    - name: "friend"
+      url: "http://friend-address:8081"
+      description: "My friend's agent"
+      auth_token: ""  # optional
+
+    - name: "colleague"
+      url: "http://colleague-address:8081"
+      description: "My colleague's agent"
+      auth_token: "shared-secret"
+  server:
+    auth_token: ""  # set to require auth for inbound A2A requests
+
+
+# Add this to ~/.hermes/.env to enable A2A as a gateway platform
+
+# A2A_ENABLED=true
+# A2A_PORT=8081
+# A2A_AUTH_TOKEN=your-secret  # optional

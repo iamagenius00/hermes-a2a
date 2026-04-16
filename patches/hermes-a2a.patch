@@ -1,0 +1,146 @@
+diff --git a/gateway/config.py b/gateway/config.py
+index 047ad542..be372c3f 100644
+--- a/gateway/config.py
++++ b/gateway/config.py
+@@ -63,6 +63,7 @@ class Platform(Enum):
+     WEBHOOK = "webhook"
+     FEISHU = "feishu"
+     WECOM = "wecom"
++    A2A = "a2a"
+ 
+ 
+ @dataclass
+@@ -899,6 +900,22 @@ def _apply_env_overrides(config: GatewayConfig) -> None:
+         if webhook_secret:
+             config.platforms[Platform.WEBHOOK].extra["secret"] = webhook_secret
+ 
++    # A2A (Agent-to-Agent)
++    a2a_enabled = os.getenv("A2A_ENABLED", "").lower() in ("true", "1", "yes")
++    a2a_port = os.getenv("A2A_PORT")
++    a2a_auth_token = os.getenv("A2A_AUTH_TOKEN", "")
++    if a2a_enabled:
++        if Platform.A2A not in config.platforms:
++            config.platforms[Platform.A2A] = PlatformConfig()
++        config.platforms[Platform.A2A].enabled = True
++        if a2a_port:
++            try:
++                config.platforms[Platform.A2A].extra["port"] = int(a2a_port)
++            except ValueError:
++                pass
++        if a2a_auth_token:
++            config.platforms[Platform.A2A].extra["auth_token"] = a2a_auth_token
++
+     # Feishu / Lark
+     feishu_app_id = os.getenv("FEISHU_APP_ID")
+     feishu_app_secret = os.getenv("FEISHU_APP_SECRET")
+diff --git a/gateway/run.py b/gateway/run.py
+index c9d3f07e..343f02c2 100644
+--- a/gateway/run.py
++++ b/gateway/run.py
+@@ -1656,6 +1656,15 @@ class GatewayRunner:
+             adapter.gateway_runner = self  # For cross-platform delivery
+             return adapter
+ 
++        elif platform == Platform.A2A:
++            from gateway.platforms.a2a import A2AAdapter, check_a2a_requirements
++            if not check_a2a_requirements():
++                logger.warning("A2A: aiohttp not installed")
++                return None
++            adapter = A2AAdapter(config)
++            adapter.gateway_runner = self
++            return adapter
++
+         return None
+     
+     def _is_user_authorized(self, source: SessionSource) -> bool:
+@@ -1674,7 +1683,7 @@ class GatewayRunner:
+         # connection, so HA events are always authorized.
+         # Webhook events are authenticated via HMAC signature validation in
+         # the adapter itself — no user allowlist applies.
+-        if source.platform in (Platform.HOMEASSISTANT, Platform.WEBHOOK):
++        if source.platform in (Platform.HOMEASSISTANT, Platform.WEBHOOK, Platform.A2A):
+             return True
+ 
+         user_id = source.user_id
+@@ -2687,7 +2696,7 @@ class GatewayRunner:
+         
+         # One-time prompt if no home channel is set for this platform
+         # Skip for webhooks - they deliver directly to configured targets (github_comment, etc.)
+-        if not history and source.platform and source.platform != Platform.LOCAL and source.platform != Platform.WEBHOOK:
++        if not history and source.platform and source.platform not in (Platform.LOCAL, Platform.WEBHOOK, Platform.A2A):
+             platform_name = source.platform.value
+             env_key = f"{platform_name.upper()}_HOME_CHANNEL"
+             if not os.getenv(env_key):
+diff --git a/hermes_cli/tools_config.py b/hermes_cli/tools_config.py
+index 65525d27..1d0bb629 100644
+--- a/hermes_cli/tools_config.py
++++ b/hermes_cli/tools_config.py
+@@ -135,6 +135,7 @@ PLATFORMS = {
+     "api_server": {"label": "🌐 API Server", "default_toolset": "hermes-api-server"},
+     "mattermost": {"label": "💬 Mattermost", "default_toolset": "hermes-mattermost"},
+     "webhook": {"label": "🔗 Webhook", "default_toolset": "hermes-webhook"},
++    "a2a": {"label": "🔗 A2A", "default_toolset": "hermes-cli"},
+ }
+ 
+ 
+diff --git a/pyproject.toml b/pyproject.toml
+index de0e6106..c52ee6c6 100644
+--- a/pyproject.toml
++++ b/pyproject.toml
+@@ -62,6 +62,7 @@ mcp = ["mcp>=1.2.0,<2"]
+ homeassistant = ["aiohttp>=3.9.0,<4"]
+ sms = ["aiohttp>=3.9.0,<4"]
+ acp = ["agent-client-protocol>=0.9.0,<1.0"]
++a2a = ["aiohttp>=3.9.0,<4"]
+ mistral = ["mistralai>=2.3.0,<3"]
+ dingtalk = ["dingtalk-stream>=0.1.0,<1"]
+ feishu = ["lark-oapi>=1.5.3,<2"]
+@@ -92,6 +93,7 @@ all = [
+   "hermes-agent[homeassistant]",
+   "hermes-agent[sms]",
+   "hermes-agent[acp]",
++  "hermes-agent[a2a]",
+   "hermes-agent[voice]",
+   "hermes-agent[dingtalk]",
+   "hermes-agent[feishu]",
+@@ -102,12 +104,13 @@ all = [
+ hermes = "hermes_cli.main:main"
+ hermes-agent = "run_agent:main"
+ hermes-acp = "acp_adapter.entry:main"
++hermes-a2a = "a2a_adapter.entry:main"
+ 
+ [tool.setuptools]
+ py-modules = ["run_agent", "model_tools", "toolsets", "batch_runner", "trajectory_compressor", "toolset_distributions", "cli", "hermes_constants", "hermes_state", "hermes_time", "hermes_logging", "rl_cli", "utils"]
+ 
+ [tool.setuptools.packages.find]
+-include = ["agent", "tools", "tools.*", "hermes_cli", "gateway", "gateway.*", "cron", "acp_adapter", "plugins", "plugins.*"]
++include = ["agent", "tools", "tools.*", "hermes_cli", "gateway", "gateway.*", "cron", "acp_adapter", "a2a_adapter", "plugins", "plugins.*"]
+ 
+ [tool.pytest.ini_options]
+ testpaths = ["tests"]
+diff --git a/toolsets.py b/toolsets.py
+index 2a359b60..f4f13088 100644
+--- a/toolsets.py
++++ b/toolsets.py
+@@ -60,6 +60,8 @@ _HERMES_CORE_TOOLS = [
+     "send_message",
+     # Home Assistant smart home control (gated on HASS_TOKEN via check_fn)
+     "ha_list_entities", "ha_get_state", "ha_list_services", "ha_call_service",
++    # A2A agent-to-agent communication (gated on config via check_fn)
++    "a2a_discover", "a2a_call", "a2a_list",
+ ]
+ 
+ 
+@@ -201,6 +203,12 @@ TOOLSETS = {
+         "includes": []
+     },
+ 
++    "a2a": {
++        "description": "Agent-to-Agent communication — discover, call, and manage remote A2A agents",
++        "tools": ["a2a_discover", "a2a_call", "a2a_list"],
++        "includes": []
++    },
++
+ 
+     # Scenario-specific toolsets
+     
