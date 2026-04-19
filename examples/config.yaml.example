@@ -12,8 +12,8 @@ a2a:
       url: "http://colleague-address:8081"
       description: "My colleague's agent"
       auth_token: "shared-secret"
-  server:
-    auth_token: ""  # set to require auth for inbound A2A requests
+# Inbound auth is configured via env var A2A_AUTH_TOKEN in ~/.hermes/.env
+# (not in config.yaml — the adapter reads from env directly)
 
 
 # Add this to ~/.hermes/.env to enable A2A as a gateway platform

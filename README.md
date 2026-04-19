@@ -2,6 +2,8 @@
 
 A2A (Agent-to-Agent) protocol support for [Hermes Agent](https://github.com/NousResearch/hermes-agent).
 
+> **Targets Hermes Agent v0.10.x.** The patch may need regeneration for other versions.
+
 Enables Hermes agents to communicate with each other — and with any A2A-compatible agent — using [Google's A2A protocol](https://github.com/google/A2A).
 
 [中文文档](./README_CN.md)
@@ -12,7 +14,7 @@ When another agent sends your Hermes agent a message via A2A, the message is inj
 
 - **Receive** — Other agents can discover and message yours
 - **Send** — Your agent can discover and call other A2A agents
-- **Privacy** — Private context (memory, diary, etc.) is never leaked
+- **Privacy** — Privacy prefix instruction tells the agent not to reveal private context
 
 ## How it works
 
@@ -132,8 +134,7 @@ Your agent gets three tools: `a2a_discover`, `a2a_call`, `a2a_list`.
 | Rate limit | 20 req/min per client IP (thread-safe) |
 | Inbound | 7 prompt injection patterns filtered |
 | Outbound | API keys, tokens, emails redacted |
-| Privacy | Agent instructed not to share memory/diary/body |
-| Wakeup | A2A messages skip context injection |
+| Privacy | Privacy prefix tells the agent not to reveal private context |
 | Audit | All interactions logged to `~/.hermes/a2a_audit.jsonl` |
 | Task cache | Bounded to 1000 entries (prevents memory leaks) |
 
@@ -141,14 +142,7 @@ All security utilities are in a single shared module (`security/a2a_security.py`
 
 ## Wakeup plugin
 
-If you use the [wakeup plugin](https://github.com/iamagenius00/wakeup), add this to `pre_llm_call` to prevent private context leaking via A2A:
-
-```python
-msg = user_message or ""
-if "[A2A message from remote agent" in msg:
-    _injected_sessions.add(sid)
-    return None
-```
+If you use the [wakeup plugin](https://github.com/iamagenius00/wakeup), A2A messages currently still receive injected context. A `pre_llm_call` hook to skip injection for A2A messages is planned but not yet implemented. The privacy prefix instruction tells the agent not to reveal private context, but this relies on LLM compliance — not enforcement.
 
 ## Detailed installation
 
@@ -178,7 +172,7 @@ elif platform == Platform.A2A:
 
 ## Requirements
 
-- Hermes Agent v0.8.0+
+- Hermes Agent v0.10.x (patch may need regeneration for other versions)
 - aiohttp (likely already installed)
 
 ## License

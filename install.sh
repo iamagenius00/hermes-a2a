@@ -15,6 +15,11 @@ fi
 
 echo "Installing hermes-a2a into $HERMES_DIR ..."
 
+# Backup existing files before overwriting
+for f in tools/a2a_security.py gateway/platforms/a2a.py tools/a2a_tools.py; do
+    [ -f "$HERMES_DIR/$f" ] && cp "$HERMES_DIR/$f" "$HERMES_DIR/$f.bak"
+done
+
 # Copy shared security module
 cp "$SCRIPT_DIR/security/a2a_security.py" "$HERMES_DIR/tools/a2a_security.py"
 echo "  + tools/a2a_security.py"

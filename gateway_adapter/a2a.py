@@ -49,7 +49,7 @@ from tools.a2a_security import (
 logger = logging.getLogger(__name__)
 
 DEFAULT_HOST = "127.0.0.1"
-DEFAULT_PORT = 8090
+DEFAULT_PORT = 8081
 _TASK_CACHE_MAX = 1000
 
 try:
