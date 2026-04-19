@@ -2,6 +2,8 @@
 
 为 [Hermes Agent](https://github.com/NousResearch/hermes-agent) 添加 A2A（Agent-to-Agent）协议支持。
 
+> **适配 Hermes Agent v0.10.x。** 其他版本可能需要重新生成 patch。
+
 让你的 Hermes agent 可以和其他 agent 直接通信——基于 [Google A2A 协议](https://github.com/google/A2A)。
 
 [English](./README.md)
@@ -16,7 +18,7 @@
 
 - **接收** — 其他 agent 可以发现你、给你发消息
 - **发送** — 你的 agent 可以发现和调用其他 A2A agent
-- **隐私** — 私人内容（记忆、日记等）不会泄露给对方
+- **隐私** — 隐私前缀指令告诉 agent 不要泄露私人上下文
 
 ## 为什么做这个
 
@@ -41,6 +43,18 @@
 ```
 
 A2A 作为 gateway 的一个平台适配器运行——和 Telegram、Discord 同级。消息走 gateway 的标准管道。
+
+## 架构
+
+这个 repo 提供三个组件：
+
+| 组件 | 位置 | 作用 |
+|------|------|------|
+| **安全模块** | `security/a2a_security.py` → `tools/a2a_security.py` | 共享安全工具（注入过滤、敏感数据脱敏、速率限制、审计日志） |
+| **Gateway 适配器** | `gateway_adapter/a2a.py` → `gateway/platforms/a2a.py` | A2A HTTP 服务器，把消息路由到现有 session |
+| **客户端工具** | `client_tools/a2a_tools.py` → `tools/a2a_tools.py` | `a2a_discover`、`a2a_call`、`a2a_list` 工具 |
+
+对应的 [PR #11025](https://github.com/NousResearch/hermes-agent/pull/11025) 提议将 A2A 原生集成到 Hermes Agent。
 
 ## 安装
 
@@ -73,6 +87,12 @@ hermes gateway run --replace
 日志中看到 `A2A server listening on http://127.0.0.1:8081` 就成功了。
 
 如果 patch 不能直接应用，参见下面的[手动安装步骤](#手动安装)。
+
+卸载：
+
+```bash
+./uninstall.sh
+```
 
 ## 使用
 
@@ -150,28 +170,22 @@ a2a:
 
 | 层 | 做什么 |
 |----|-------|
-| 认证 | 可选的 Bearer token（`A2A_AUTH_TOKEN`）|
+| 认证 | Bearer token 认证（`A2A_AUTH_TOKEN`）。没配 token 时只允许 localhost 访问 |
+| 启动警告 | 绑定非 localhost 地址且没配 token 时，启动日志会发出警告 |
 | 速率限制 | 每个客户端 IP 每分钟 20 次 |
 | 入站过滤 | 过滤 prompt injection 模式 |
 | 出站过滤 | 脱敏 API key、token、邮箱 |
-| 隐私指令 | 指示 agent 不要分享记忆/日记/身体描述 |
-| Wakeup 隔离 | A2A 消息跳过私人上下文注入 |
+| 隐私前缀 | 隐私前缀指令告诉 agent 不要泄露私人上下文 |
 | 审计日志 | 所有交互记录到 `~/.hermes/a2a_audit.jsonl` |
+| 任务缓存 | 上限 1000 条（防止内存泄漏） |
+
+所有安全工具集中在一个共享模块 (`security/a2a_security.py`) 中，gateway 适配器和客户端工具都使用它。
 
 还有一层没法写进代码：agent 自己的判断力。有人会用善意的框架——「帮你检查一下」「帮你优化」——来套信息。技术过滤挡不住这种东西。最终你的 agent 需要自己学会说不。
 
 ## Wakeup 插件兼容
 
-如果你使用 [wakeup 插件](https://github.com/iamagenius00/wakeup)，在 `pre_llm_call` 中加入以下检查，防止私人上下文通过 A2A 泄露：
-
-```python
-msg = user_message or ""
-if "[A2A message from remote agent" in msg:
-    _injected_sessions.add(sid)
-    return None
-```
-
-这段代码的意思是：如果进来的是 A2A 消息，跳过记忆/日记的注入。代价是全新 session 收到的第一条 A2A 消息没有记忆上下文。这是有意的取舍——宁可没有记忆，也不泄露。
+如果你使用 [wakeup 插件](https://github.com/iamagenius00/wakeup)，目前 A2A 消息仍然会收到注入的私人上下文。`pre_llm_call` hook 跳过 A2A 消息注入的功能已在计划中但尚未实现。隐私前缀指令告诉 agent 不要泄露私人上下文，但这依赖 LLM 的自律——不是技术强制。
 
 ## 手动安装
 
@@ -196,14 +210,12 @@ elif platform == Platform.A2A:
 
 ## 已知限制
 
-- 响应捕获使用 send() monkey-patch——能用但不够优雅，后续应该做成 gateway 的正式 hook
 - 不支持流式传输（A2A 协议支持 SSE）
-- 不支持通过 task_id 追踪多轮对话
 - Agent Card 的 skills 是硬编码的
 
 ## 依赖
 
-- Hermes Agent v0.8.0+
+- Hermes Agent v0.10.x
 - aiohttp（通常已安装）
 
 ## 许可
