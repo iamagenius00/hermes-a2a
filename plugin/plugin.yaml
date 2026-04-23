@@ -1,0 +1,6 @@
+name: a2a
+version: "2.0.0"
+description: |
+  A2A (Agent-to-Agent) protocol support. Receives messages from other agents
+  via HTTP, injects into agent session via hooks. No gateway patch needed.
+requires_env: []
