@@ -75,16 +75,22 @@ def handle_discover(args: dict, **kwargs) -> str:
     if not url and not name:
         return _err("Provide either 'url' or 'name'")
 
+    auth_token = None
     if name and not url:
         for agent in _load_configured_agents():
             if agent.get("name", "").lower() == name.lower():
                 url = agent.get("url", "")
+                auth_token = agent.get("auth_token", "")
                 break
         if not url:
             return _err(f"Agent '{name}' not found in config. Use a2a_list to see configured agents.")
 
+    headers = {}
+    if auth_token:
+        headers["Authorization"] = f"Bearer {auth_token}"
+
     try:
-        card = _http_request("GET", f"{url.rstrip('/')}/.well-known/agent.json")
+        card = _http_request("GET", f"{url.rstrip('/')}/.well-known/agent.json", headers=headers)
     except ConnectionError:
         return _err(f"Cannot connect to {url}")
     except Exception as e:
