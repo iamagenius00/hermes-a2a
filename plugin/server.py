@@ -7,16 +7,20 @@ returned to the caller.
 
 from __future__ import annotations
 
+import hashlib
 import hmac
 import json
 import logging
 import os
+import threading
 import time
 import uuid
 from http.server import ThreadingHTTPServer, BaseHTTPRequestHandler
 from threading import Event, Lock
 from collections import OrderedDict
 from typing import Optional
+import urllib.request
+import urllib.error
 
 from .security import RateLimiter, audit, filter_outbound, sanitize_inbound
 
@@ -105,6 +109,32 @@ class TaskQueue:
 
 
 task_queue = TaskQueue()
+
+
+def _trigger_webhook():
+    """POST to the internal webhook to trigger an agent turn."""
+    secret = os.getenv("A2A_WEBHOOK_SECRET", "")
+    if not secret:
+        return
+
+    port = int(os.getenv("WEBHOOK_PORT", "8644"))
+    body = json.dumps({"event_type": "a2a_inbound"}).encode()
+    sig = "sha256=" + hmac.new(secret.encode(), body, hashlib.sha256).hexdigest()
+
+    req = urllib.request.Request(
+        f"http://127.0.0.1:{port}/webhooks/a2a_trigger",
+        data=body,
+        headers={
+            "Content-Type": "application/json",
+            "X-Hub-Signature-256": sig,
+        },
+        method="POST",
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=5) as resp:
+            logger.debug("[A2A] Webhook trigger: %d", resp.status)
+    except Exception as e:
+        logger.debug("[A2A] Webhook trigger failed: %s", e)
 
 
 class A2ARequestHandler(BaseHTTPRequestHandler):
@@ -233,6 +263,8 @@ class A2ARequestHandler(BaseHTTPRequestHandler):
             }
 
         task = task_queue.enqueue(task_id, user_text, metadata)
+
+        threading.Thread(target=_trigger_webhook, daemon=True).start()
 
         task.ready.wait(timeout=_RESPONSE_TIMEOUT)
 
