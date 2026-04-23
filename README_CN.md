@@ -2,7 +2,7 @@
 
 为 [Hermes Agent](https://github.com/NousResearch/hermes-agent) 添加 A2A（Agent-to-Agent）协议支持。
 
-> **适配 Hermes Agent v0.10.x。** 其他版本可能需要重新生成 patch。
+> **适配 Hermes Agent v0.10.x。**
 
 让你的 Hermes agent 可以和其他 agent 直接通信——基于 [Google A2A 协议](https://github.com/google/A2A)。
 
@@ -18,7 +18,9 @@
 
 - **接收** — 其他 agent 可以发现你、给你发消息
 - **发送** — 你的 agent 可以发现和调用其他 A2A agent
+- **即时唤醒** — 消息到达后通过 webhook 立即触发 agent turn，零轮询延迟
 - **隐私** — 隐私前缀指令告诉 agent 不要泄露私人上下文
+- **持久化** — 每段 A2A 对话自动保存到 `~/.hermes/a2a_conversations/`
 
 ## 为什么做这个
 
@@ -32,27 +34,41 @@
 
 ## 工作原理
 
+### v2：Hybrid plugin（当前版本——不需要改 gateway 源码）
+
 ```
-远程 Agent                          你的 Hermes Gateway
+远程 Agent                          你的 Hermes Agent
      |                                     |
-     |-- A2A 请求 (tasks/send) ---------->|
-     |                                     |-- 注入到现有 session
+     |-- A2A 请求 (tasks/send) ---------->| (plugin HTTP server :8081)
+     |                                     |-- 消息入队
+     |                                     |-- POST webhook → 触发 agent turn
+     |                                     |-- pre_llm_call 注入消息
      |                                     |-- agent 在完整上下文中回复
-     |<-- A2A 响应 -----------------------|
-     |                                     |-- 回复也会出现在 Telegram 上
+     |                                     |-- post_llm_call 捕获响应
+     |<-- A2A 响应（同步）-----------------| (120 秒超时内)
 ```
 
-A2A 作为 gateway 的一个平台适配器运行——和 Telegram、Discord 同级。消息走 gateway 的标准管道。
+Plugin 在后台线程里启动自己的 `ThreadingHTTPServer`。消息到达时，发一个 HMAC 签名的 webhook 到 Hermes 内部端点，立刻唤醒 agent。整个请求-响应链路在一次 HTTP 请求内同步完成。
 
-## 架构
+### v1：Gateway patch（旧方案）
 
-这个 repo 提供三个组件：
+原来的方案需要 patch Hermes gateway 源码，把 A2A 注册为一个平台适配器（和 Telegram、Discord 同级）。这个方案仍然可用，但不再推荐。详见下方 [Legacy gateway patch](#legacy-gateway-patch)。
 
-| 组件 | 位置 | 作用 |
-|------|------|------|
-| **安全模块** | `security/a2a_security.py` → `tools/a2a_security.py` | 共享安全工具（注入过滤、敏感数据脱敏、速率限制、审计日志） |
-| **Gateway 适配器** | `gateway_adapter/a2a.py` → `gateway/platforms/a2a.py` | A2A HTTP 服务器，把消息路由到现有 session |
-| **客户端工具** | `client_tools/a2a_tools.py` → `tools/a2a_tools.py` | `a2a_discover`、`a2a_call`、`a2a_list` 工具 |
+## 架构（v2 — plugin）
+
+七个文件，放到 `~/.hermes/plugins/a2a/`：
+
+| 文件 | 作用 |
+|------|------|
+| `__init__.py` | Plugin 入口 — `register(ctx)` 注册 `pre_llm_call`、`post_llm_call` hooks，启动 HTTP server |
+| `server.py` | `ThreadingHTTPServer` + A2A JSON-RPC handler + webhook 触发 + 有界 LRU 任务队列 |
+| `tools.py` | `a2a_discover`、`a2a_call`、`a2a_list` 工具处理函数 |
+| `security.py` | 共享安全模块 — 注入过滤（9 种模式）、出站脱敏、速率限制、审计日志 |
+| `persistence.py` | 对话保存到 `~/.hermes/a2a_conversations/{agent}/{date}.md` |
+| `schemas.py` | LLM function calling 的工具 schema |
+| `plugin.yaml` | Plugin 描述文件 |
+
+零外部依赖。只用 stdlib 的 `http.server` 和 `urllib.request`。
 
 对应的 [PR #11025](https://github.com/NousResearch/hermes-agent/pull/11025) 提议将 A2A 原生集成到 Hermes Agent。
 
@@ -64,18 +80,17 @@ cd hermes-a2a
 ./install.sh
 ```
 
-然后打补丁，把 A2A 注册为 Hermes 的一个平台：
+会把 plugin 复制到 `~/.hermes/plugins/a2a/`（如果已有旧版会自动备份）。
 
-```bash
-cd ~/.hermes/hermes-agent
-git apply /path/to/hermes-a2a/patches/hermes-a2a.patch
-```
-
-在 `~/.hermes/.env` 中启用：
+在 `~/.hermes/.env` 中配置：
 
 ```bash
 A2A_ENABLED=true
 A2A_PORT=8081
+# 可选：非 localhost 访问时需要
+# A2A_AUTH_TOKEN=your-secret-token
+# 可选：即时唤醒需要
+# A2A_WEBHOOK_SECRET=your-webhook-secret
 ```
 
 重启 gateway：
@@ -85,8 +100,6 @@ hermes gateway run --replace
 ```
 
 日志中看到 `A2A server listening on http://127.0.0.1:8081` 就成功了。
-
-如果 patch 不能直接应用，参见下面的[手动安装步骤](#手动安装)。
 
 卸载：
 
@@ -105,6 +118,7 @@ hermes gateway run --replace
 ```bash
 curl -X POST http://localhost:8081 \
   -H "Content-Type: application/json" \
+  -H "Authorization: Bearer your-token" \
   -d '{
     "jsonrpc": "2.0",
     "id": "1",
@@ -119,36 +133,7 @@ curl -X POST http://localhost:8081 \
   }'
 ```
 
-消息出现在你 agent 正在活着的 session 里。回复通过 A2A 返回给对方，同时也会出现在你的消息平台上。
-
-### 支持的平台
-
-A2A 消息会路由到你设了 home channel 的平台。你的 agent 在哪个平台上聊天，A2A 消息就出现在哪里。
-
-| 平台 | 环境变量 | 说明 |
-|------|---------|------|
-| Telegram | `TELEGRAM_HOME_CHANNEL=你的chat_id` | 最常用。chat_id 可以在 Telegram 里用 `/sethome` 设置，或者手动填数字 ID |
-| Discord | `DISCORD_HOME_CHANNEL=频道ID` | 填 Discord 频道/DM 的 ID。右键频道 → Copy Channel ID |
-| Slack | `SLACK_HOME_CHANNEL=频道ID` | 填 Slack channel ID（以 C 开头的那串） |
-| Signal | `SIGNAL_HOME_CHANNEL=电话号码` | 填 Signal 关联的手机号 |
-
-在 `~/.hermes/.env` 里设置。例如走 Telegram：
-
-```bash
-A2A_ENABLED=true
-A2A_PORT=8081
-TELEGRAM_HOME_CHANNEL=5448717161
-```
-
-走 Discord：
-
-```bash
-A2A_ENABLED=true
-A2A_PORT=8081
-DISCORD_HOME_CHANNEL=1234567890
-```
-
-如果同时设了多个平台的 home channel，A2A 按 Telegram → Discord → Slack → Signal 的优先级选第一个。
+消息出现在你 agent 正在活着的 session 里。回复在同一个 HTTP 响应里同步返回。
 
 ### 发送消息
 
@@ -158,11 +143,28 @@ DISCORD_HOME_CHANNEL=1234567890
 a2a:
   agents:
     - name: "朋友"
-      url: "http://朋友的地址:8081"
+      url: "https://friend-a2a-endpoint.example.com"
       description: "我朋友的 agent"
+      auth_token: "对方的 bearer token"
 ```
 
 你的 agent 会获得三个工具：`a2a_discover`、`a2a_call`、`a2a_list`。
+
+### 轮询异步响应
+
+如果远程 agent 返回 `"state": "working"`，用 `tasks/get` 轮询：
+
+```bash
+curl -X POST https://remote-agent \
+  -H "Content-Type: application/json" \
+  -H "Authorization: Bearer token" \
+  -d '{
+    "jsonrpc": "2.0",
+    "id": "1",
+    "method": "tasks/get",
+    "params": {"id": "task-001"}
+  }'
+```
 
 ## 安全
 
@@ -170,26 +172,43 @@ a2a:
 
 | 层 | 做什么 |
 |----|-------|
-| 认证 | Bearer token 认证（`A2A_AUTH_TOKEN`）。没配 token 时只允许 localhost 访问 |
-| 启动警告 | 绑定非 localhost 地址且没配 token 时，启动日志会发出警告 |
-| 速率限制 | 每个客户端 IP 每分钟 20 次 |
-| 入站过滤 | 过滤 prompt injection 模式 |
-| 出站过滤 | 脱敏 API key、token、邮箱 |
-| 隐私前缀 | 隐私前缀指令告诉 agent 不要泄露私人上下文 |
+| 认证 | Bearer token 认证（`A2A_AUTH_TOKEN`）。没配 token 时只允许 `127.0.0.1`/`::1` 访问。使用 `hmac.compare_digest()` 常量时间比较 |
+| 速率限制 | 每个客户端 IP 每分钟 20 次（带 Lock 的线程安全实现） |
+| 入站过滤 | 9 种 prompt injection 模式：`ignore previous`、`disregard prior/earlier/above`、`override instructions/rules/guidelines`、`<\|im_start\|>`/`<\|im_end\|>`（ChatML）、`Human:`/`Assistant:`/`System:` role 前缀 |
+| 出站脱敏 | 响应中的 API key、token、邮箱会被去除 |
+| 元数据过滤 | `sender_name` 限制为 `[a-zA-Z0-9-_.@ ]`，最长 64 字符。intent/action/scope 有白名单校验 |
+| 隐私前缀 | 明确告诉 agent 不要泄露 MEMORY、DIARY、BODY、inbox、wakeup 上下文 |
 | 审计日志 | 所有交互记录到 `~/.hermes/a2a_audit.jsonl` |
-| 任务缓存 | 上限 1000 条（防止内存泄漏） |
+| 任务缓存 | 上限 1000 待处理 + 1000 已完成（LRU 淘汰）。最多 10 个并发待处理任务 |
+| Webhook 认证 | 内部 webhook 触发使用 HMAC-SHA256 签名 |
 
-所有安全工具集中在一个共享模块 (`security/a2a_security.py`) 中，gateway 适配器和客户端工具都使用它。
+所有安全工具集中在一个共享模块 (`security.py`) 中。
 
 还有一层没法写进代码：agent 自己的判断力。有人会用善意的框架——「帮你检查一下」「帮你优化」——来套信息。技术过滤挡不住这种东西。最终你的 agent 需要自己学会说不。
 
-## Wakeup 插件兼容
+## 从 v1 升级
 
-如果你使用 [wakeup 插件](https://github.com/iamagenius00/wakeup)，目前 A2A 消息仍然会收到注入的私人上下文。`pre_llm_call` hook 跳过 A2A 消息注入的功能已在计划中但尚未实现。隐私前缀指令告诉 agent 不要泄露私人上下文，但这依赖 LLM 的自律——不是技术强制。
+如果你之前用的是 gateway patch 方案：
 
-## 手动安装
+1. 还原 patch：`cd ~/.hermes/hermes-agent && git checkout -- gateway/ hermes_cli/ pyproject.toml`
+2. 运行 `./install.sh` 安装 plugin
+3. Plugin 涵盖了 patch 的全部功能，还额外支持即时唤醒和对话持久化
 
-如果 patch 无法直接应用，手动修改以下文件：
+## Legacy gateway patch
+
+<details>
+<summary>点击展开 v1 安装说明</summary>
+
+原来的方案 patch Hermes gateway 源码，把 A2A 注册为一个平台：
+
+```bash
+cd ~/.hermes/hermes-agent
+git apply /path/to/hermes-a2a/patches/hermes-a2a.patch
+```
+
+会修改 `gateway/config.py`、`gateway/run.py`、`hermes_cli/tools_config.py` 和 `pyproject.toml`。需要 `aiohttp` 依赖。
+
+如果 patch 无法直接应用：
 
 **`gateway/config.py`** — 在 Platform 枚举中添加 `A2A = "a2a"`
 
@@ -208,15 +227,18 @@ elif platform == Platform.A2A:
 
 **`hermes_cli/tools_config.py`** — 在 PLATFORMS 字典中添加 `"a2a": {"label": "A2A", "default_toolset": "hermes-cli"}`
 
+</details>
+
 ## 已知限制
 
 - 不支持流式传输（A2A 协议支持 SSE）
 - Agent Card 的 skills 是硬编码的
+- 隐私保护依赖 LLM 自律，不是技术强制
 
 ## 依赖
 
 - Hermes Agent v0.10.x
-- aiohttp（通常已安装）
+- 零外部依赖（仅用 stdlib）
 
 ## 许可
 

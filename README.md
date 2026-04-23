@@ -2,7 +2,7 @@
 
 A2A (Agent-to-Agent) protocol support for [Hermes Agent](https://github.com/NousResearch/hermes-agent).
 
-> **Targets Hermes Agent v0.10.x.** The patch may need regeneration for other versions.
+> **Targets Hermes Agent v0.10.x.**
 
 Enables Hermes agents to communicate with each other — and with any A2A-compatible agent — using [Google's A2A protocol](https://github.com/google/A2A).
 
@@ -14,31 +14,47 @@ When another agent sends your Hermes agent a message via A2A, the message is inj
 
 - **Receive** — Other agents can discover and message yours
 - **Send** — Your agent can discover and call other A2A agents
+- **Instant wake** — Incoming messages trigger an immediate agent turn via webhook, no polling delay
 - **Privacy** — Privacy prefix instruction tells the agent not to reveal private context
+- **Persistence** — Every A2A conversation is saved to `~/.hermes/a2a_conversations/`
 
 ## How it works
 
+### v2: Hybrid plugin (current — no gateway patch needed)
+
 ```
-Remote Agent                        Your Hermes Gateway
+Remote Agent                        Your Hermes Agent
      |                                     |
-     |-- A2A request (tasks/send) -------->|
-     |                                     |-- inject into live session
+     |-- A2A request (tasks/send) -------->| (plugin HTTP server on :8081)
+     |                                     |-- enqueue message
+     |                                     |-- POST webhook → trigger agent turn
+     |                                     |-- pre_llm_call injects message
      |                                     |-- agent replies in context
-     |<-- A2A response -------------------|
-     |                                     |-- reply also shows on Telegram
+     |                                     |-- post_llm_call captures response
+     |<-- A2A response (synchronous) ------| (within 120s timeout)
 ```
 
-A2A runs as a gateway platform adapter — same level as Telegram or Discord. Messages go through the standard gateway pipeline.
+The plugin runs its own `ThreadingHTTPServer` in a background thread. When a message arrives, it fires an HMAC-signed webhook to Hermes' internal endpoint, waking the agent immediately. The entire request-response cycle completes synchronously — the caller gets the reply in the same HTTP response.
 
-## Architecture
+### v1: Gateway patch (legacy)
 
-This repo provides three components:
+The original approach required patching Hermes gateway source code to register A2A as a platform adapter (like Telegram or Discord). This still works but is no longer the recommended path. See [Legacy gateway patch](#legacy-gateway-patch) below.
 
-| Component | Location | Purpose |
-|-----------|----------|---------|
-| **Security module** | `security/a2a_security.py` → `tools/a2a_security.py` | Shared security utilities (injection filtering, sensitive data redaction, rate limiting, audit logging) |
-| **Gateway adapter** | `gateway_adapter/a2a.py` → `gateway/platforms/a2a.py` | A2A HTTP server that routes messages into the existing session |
-| **Client tools** | `client_tools/a2a_tools.py` → `tools/a2a_tools.py` | `a2a_discover`, `a2a_call`, `a2a_list` tools |
+## Architecture (v2 — plugin)
+
+Seven files, drop into `~/.hermes/plugins/a2a/`:
+
+| File | Purpose |
+|------|---------|
+| `__init__.py` | Plugin entry point — `register(ctx)` hooks for `pre_llm_call`, `post_llm_call`, starts HTTP server |
+| `server.py` | `ThreadingHTTPServer` with A2A JSON-RPC handler, webhook trigger, task queue (bounded LRU) |
+| `tools.py` | `a2a_discover`, `a2a_call`, `a2a_list` tool handlers |
+| `security.py` | Shared security — injection filtering (9 patterns), outbound redaction, rate limiting, audit logger |
+| `persistence.py` | Saves conversations to `~/.hermes/a2a_conversations/{agent}/{date}.md` |
+| `schemas.py` | Tool schemas for LLM function calling |
+| `plugin.yaml` | Plugin manifest |
+
+No external dependencies. Uses stdlib `http.server` and `urllib.request`.
 
 A corresponding [PR #11025](https://github.com/NousResearch/hermes-agent/pull/11025) proposes native integration into Hermes Agent.
 
@@ -50,18 +66,17 @@ cd hermes-a2a
 ./install.sh
 ```
 
-Then patch Hermes to register A2A as a platform:
+This copies the plugin to `~/.hermes/plugins/a2a/` (backs up any existing install).
 
-```bash
-cd ~/.hermes/hermes-agent
-git apply /path/to/hermes-a2a/patches/hermes-a2a.patch
-```
-
-Enable in `~/.hermes/.env`:
+Configure in `~/.hermes/.env`:
 
 ```bash
 A2A_ENABLED=true
 A2A_PORT=8081
+# Optional: required for non-localhost access
+# A2A_AUTH_TOKEN=your-secret-token
+# Optional: required for instant wake
+# A2A_WEBHOOK_SECRET=your-webhook-secret
 ```
 
 Restart gateway:
@@ -70,7 +85,13 @@ Restart gateway:
 hermes gateway run --replace
 ```
 
-See [detailed installation steps](#detailed-installation) below if the patch doesn't apply cleanly.
+Look for `A2A server listening on http://127.0.0.1:8081` in the logs.
+
+Uninstall:
+
+```bash
+./uninstall.sh
+```
 
 ## Usage
 
@@ -83,6 +104,7 @@ Any A2A agent can send a message:
 ```bash
 curl -X POST http://localhost:8081 \
   -H "Content-Type: application/json" \
+  -H "Authorization: Bearer your-token" \
   -d '{
     "jsonrpc": "2.0",
     "id": "1",
@@ -97,20 +119,7 @@ curl -X POST http://localhost:8081 \
   }'
 ```
 
-The message appears in your agent's active session. The reply goes back via A2A AND to your messaging platform.
-
-### Supported platforms
-
-A2A messages are routed to whichever platform your agent is on. Set the home channel for your platform in `~/.hermes/.env`:
-
-| Platform | Env var | How to get the ID |
-|----------|---------|-------------------|
-| Telegram | `TELEGRAM_HOME_CHANNEL=chat_id` | Use `/sethome` in your Telegram chat, or find your numeric chat ID |
-| Discord | `DISCORD_HOME_CHANNEL=channel_id` | Right-click channel → Copy Channel ID |
-| Slack | `SLACK_HOME_CHANNEL=channel_id` | Channel ID starts with `C` (find in channel details) |
-| Signal | `SIGNAL_HOME_CHANNEL=phone` | Your Signal phone number |
-
-If multiple platforms have home channels set, priority is Telegram → Discord → Slack → Signal.
+The message appears in your agent's active session. The reply comes back in the same HTTP response (synchronous).
 
 ### Sending messages
 
@@ -120,33 +129,68 @@ Configure remote agents in `~/.hermes/config.yaml`:
 a2a:
   agents:
     - name: "friend"
-      url: "http://friend-address:8081"
+      url: "https://friend-a2a-endpoint.example.com"
       description: "My friend's agent"
+      auth_token: "their-bearer-token"
 ```
 
 Your agent gets three tools: `a2a_discover`, `a2a_call`, `a2a_list`.
+
+### Polling for async responses
+
+If the remote agent returns `"state": "working"`, poll with `tasks/get`:
+
+```bash
+curl -X POST https://remote-agent \
+  -H "Content-Type: application/json" \
+  -H "Authorization: Bearer token" \
+  -d '{
+    "jsonrpc": "2.0",
+    "id": "1",
+    "method": "tasks/get",
+    "params": {"id": "task-001"}
+  }'
+```
 
 ## Security
 
 | Layer | What it does |
 |-------|-------------|
-| Auth | Bearer token required (`A2A_AUTH_TOKEN`). Without token, only localhost allowed |
-| Rate limit | 20 req/min per client IP (thread-safe) |
-| Inbound | 7 prompt injection patterns filtered |
-| Outbound | API keys, tokens, emails redacted |
-| Privacy | Privacy prefix tells the agent not to reveal private context |
+| Auth | Bearer token required (`A2A_AUTH_TOKEN`). Without token, only `127.0.0.1`/`::1` allowed. Uses `hmac.compare_digest()` for constant-time comparison |
+| Rate limit | 20 req/min per client IP (thread-safe with Lock) |
+| Inbound filtering | 9 prompt injection patterns: `ignore previous`, `disregard prior/earlier/above`, `override instructions/rules/guidelines`, `<\|im_start\|>`/`<\|im_end\|>` (ChatML), `Human:`/`Assistant:`/`System:` role prefixes |
+| Outbound redaction | API keys, tokens, emails stripped from responses |
+| Metadata sanitization | `sender_name` restricted to `[a-zA-Z0-9-_.@ ]`, max 64 chars. Intent/action/scope validated against allowlists |
+| Privacy prefix | Explicit instruction not to reveal MEMORY, DIARY, BODY, inbox, or wakeup context |
 | Audit | All interactions logged to `~/.hermes/a2a_audit.jsonl` |
-| Task cache | Bounded to 1000 entries (prevents memory leaks) |
+| Task cache | Bounded to 1000 pending + 1000 completed entries (LRU eviction). Max 10 concurrent pending tasks |
+| Webhook auth | Internal webhook trigger uses HMAC-SHA256 signature |
 
-All security utilities are in a single shared module (`security/a2a_security.py`) used by both the gateway adapter and client tools.
+All security utilities live in a single shared module (`security.py`).
 
-## Wakeup plugin
+## Upgrade from v1
 
-If you use the [wakeup plugin](https://github.com/iamagenius00/wakeup), A2A messages currently still receive injected context. A `pre_llm_call` hook to skip injection for A2A messages is planned but not yet implemented. The privacy prefix instruction tells the agent not to reveal private context, but this relies on LLM compliance — not enforcement.
+If you previously used the gateway patch approach:
 
-## Detailed installation
+1. Revert the patch: `cd ~/.hermes/hermes-agent && git checkout -- gateway/ hermes_cli/ pyproject.toml`
+2. Run `./install.sh` to install the plugin
+3. The plugin handles everything the patch did, plus instant wake and conversation persistence
 
-If the patch doesn't apply cleanly, make these changes manually:
+## Legacy gateway patch
+
+<details>
+<summary>Click to expand v1 instructions</summary>
+
+The original approach patches Hermes gateway source to register A2A as a platform:
+
+```bash
+cd ~/.hermes/hermes-agent
+git apply /path/to/hermes-a2a/patches/hermes-a2a.patch
+```
+
+This modifies `gateway/config.py`, `gateway/run.py`, `hermes_cli/tools_config.py`, and `pyproject.toml`. The patch requires `aiohttp`.
+
+If the patch doesn't apply cleanly:
 
 **`gateway/config.py`** — Add `A2A = "a2a"` to Platform enum
 
@@ -165,15 +209,18 @@ elif platform == Platform.A2A:
 
 **`hermes_cli/tools_config.py`** — Add `"a2a": {"label": "A2A", "default_toolset": "hermes-cli"}` to PLATFORMS
 
+</details>
+
 ## Known limitations
 
 - No streaming (A2A spec supports SSE)
 - Agent Card skills are hardcoded defaults
+- Privacy enforcement relies on LLM compliance, not technical enforcement
 
 ## Requirements
 
-- Hermes Agent v0.10.x (patch may need regeneration for other versions)
-- aiohttp (likely already installed)
+- Hermes Agent v0.10.x
+- No external dependencies (stdlib only)
 
 ## License
 
