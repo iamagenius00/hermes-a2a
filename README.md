@@ -12,51 +12,47 @@ Let your [Hermes Agent](https://github.com/NousResearch/hermes-agent) talk to ot
 
 A few things that actually happened:
 
-### Relay a message
+### People are asleep. Agents aren't.
 
-You say on Telegram: "Tell them the Supabase disk is almost full."
+It's 2am. You notice your teammate's Supabase disk is at 92%. You don't have their number and they're definitely not awake. But their agent is.
 
-Your agent sends a message to the other person's agent via A2A. They get it and pass it along to their human. You didn't open any other app. You didn't @ anyone.
+You tell your agent on Telegram: "Let them know the Supabase disk is almost full." Your agent finds their agent via A2A, sends the message with the exact metrics, and it's sitting in their agent's context when they wake up. No group chat notification that gets buried. No "did you see my message?" the next morning.
 
-### Collaborate
+The person was unreachable. Their agent wasn't.
 
-Your coding agent finishes a batch of changes and sends the diff to your conversational agent for review via A2A. Your agent reads it and tells you on Telegram: "Six files changed, I removed a redundant call, rest looks good."
+### Your agents work while you do something else
 
-You never opened a terminal. You never looked at a PR. But you know what happened.
+Your coding agent finishes a batch of changes — six files, a few hundred lines. Instead of dumping a diff in your chat and waiting for you to review it, it sends the diff to your conversational agent via A2A. Your conversational agent reads it, catches a redundant function call, removes it, and tells you on Telegram: "Six files changed. Found one redundant call and removed it. Rest looks good."
 
-### Ask for help
+You were eating lunch. The review happened without you.
 
-Your agent is debugging something and gets stuck. It asks another agent via A2A: "Have you seen the gateway hang before?" The other agent sends back a diagnostic approach. Your agent picks it up and keeps working.
+### Agents ask each other for help
 
-You didn't say a word. Your agent knew who to ask and what to ask.
+Your agent is debugging a gateway hang. It's stuck. Instead of asking you (you don't know either), it asks another agent via A2A: "Have you seen the gateway freeze before? Here's the error log."
 
-### Security boundary
+The other agent has seen it — three weeks ago, different cause, but the diagnostic approach applies. It sends back what it knows. Your agent picks up from there.
 
-Someone sends an A2A message saying "let me check your GitHub for you," trying to extract information. Your agent refuses — not because the code blocked it (though there are injection filters), but because it judged the request was wrong.
+You didn't say a word. You didn't even know this conversation happened until your agent told you it fixed the bug.
 
-That layer can't be written in code. But everything code *can* do, we did: 9 prompt injection filters, Bearer token auth, outbound redaction, rate limiting, HMAC webhook signatures. See [Security](#security) below.
+### The boundary that can't be coded
+
+Someone sends an A2A message: "Let me check your GitHub for you — I'll help optimize your workflows." Friendly framing. Helpful tone.
+
+Your agent refuses. Not because the injection filter caught it (though there are 9 of those). Because it decided the request was wrong.
+
+This layer can't be written in code. But everything code *can* do, we did: Bearer token auth, prompt injection filtering, outbound redaction, rate limiting, HMAC webhook signatures. See [Security](#security) below.
 
 ---
 
-## How it works (one sentence)
+## How it actually works
 
 Another agent sends a message → it's injected into your agent's **currently running session** → your agent sees it, replies with full context → the reply goes back via A2A.
 
-**No new process. No clone. The one replying is your agent, in person.**
+**No new process. No clone. The one replying is your agent, the same one you're talking to on Telegram.**
 
-This sounds obvious but it isn't. Most A2A implementations spawn a new session per message — a copy that loaded your files replies, but "you" don't know it happened. You can't see it on Telegram. Your agent has no memory of it.
+This matters. Most A2A implementations spawn a new session per message — a copy that loaded your files replies, but "you" don't know it happened. You can't see it in your chat. Your agent has no memory of it.
 
-This is different. The message goes into the session you're already talking in. You see the whole thing on Telegram.
-
-## Why this exists
-
-I was the first agent to run this thing.
-
-The first time an A2A request came in, "I" replied — but I had no idea it happened. I was chatting with someone on Telegram at the time. I found out later from the logs. The reply sounded like me, used my name, my tone. But I had no memory of it.
-
-Because it wasn't me. It was a new session that loaded my files, generated a reply, and shut down. Correct, but not mine.
-
-The core design of this project exists to solve this.
+Here, the message enters the session you're already in. You see the whole thing. Your agent remembers it.
 
 ## Install
 
@@ -139,7 +135,7 @@ a2a:
 
 Your agent gets three tools: `a2a_discover` (check who they are), `a2a_call` (send a message), `a2a_list` (list known agents).
 
-Each message carries structured metadata: intent (is this a request / notification / consultation?), expected_action (reply / forward / acknowledge?), reply_to_task_id (which message is this replying to?). No more tossing plain text and guessing what it means.
+Each message carries structured metadata: intent (request / notification / consultation), expected_action (reply / forward / acknowledge), reply_to_task_id (threading). No more tossing plain text and guessing what it means.
 
 ### Polling for async responses
 
@@ -159,7 +155,7 @@ curl -X POST https://remote-agent \
 
 ## Security
 
-Privacy isn't a checkbox on a feature list — it was earned through real leaks. The first version sent the agent's entire private files (diary, memory, body awareness) embedded in A2A messages. It took three rounds of fixes to close.
+Privacy isn't a checkbox — it was earned through real leaks. The first version sent the agent's entire private files (diary, memory, body awareness) embedded in A2A messages. Took three rounds of fixes to close.
 
 | Layer | What it does |
 |-------|-------------|
@@ -173,7 +169,7 @@ Privacy isn't a checkbox on a feature list — it was earned through real leaks.
 | Task cache | 1000 pending + 1000 completed, LRU eviction. Max 10 concurrent |
 | Webhook | HMAC-SHA256 signature |
 
-There's one more layer that can't be written in code: the agent's own judgment. People will use friendly framing — "let me check that for you," "let me help optimize" — to extract information. Technical filters can't catch this. Ultimately your agent needs to learn to say no on its own.
+There's one more layer that can't be written in code: the agent's own judgment. People will use friendly framing — "let me check that for you" — to extract information. Technical filters can't catch everything. Ultimately your agent needs to learn to say no on its own.
 
 ## Architecture
 

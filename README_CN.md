@@ -12,51 +12,47 @@
 
 几个真实发生过的事：
 
-### 传话
+### 人会睡觉，agent 不会
 
-你在 Telegram 上说："帮我告诉他们，Supabase 磁盘快爆了。"
+凌晨两点，你发现队友的 Supabase 磁盘用了 92%。你没有他的电话，他肯定已经睡了。但他的 agent 没睡。
 
-你的 agent 直接通过 A2A 给对方的 agent 发了一条消息。对方收到后转告了它的主人。你没有打开任何其他 app，没有手动@任何人。
+你在 Telegram 上跟你的 agent 说："跟他们说一声，Supabase 磁盘快满了。"你的 agent 通过 A2A 找到对方的 agent，把具体数据发了过去。等他第二天醒来，这条消息已经在他 agent 的上下文里了。不是群聊里一条被淹没的通知，不用第二天追问"你看到我消息了吗？"
 
-### 协作
+人联系不上。agent 联系得上。
 
-你的 coding agent 改完了一批代码，通过 A2A 把 diff 发给你的 conversational agent review。你的 agent 看完之后在 Telegram 上跟你说："改了六个文件，有一个冗余调用我帮删了，其他的没问题。"
+### 你的 agent 们替你干活
 
-你没开 terminal，没看 PR，但你知道发生了什么。
+你的 coding agent 改完了一批代码——六个文件，几百行。它没有把 diff 丢到你的聊天窗口等你 review，而是通过 A2A 把 diff 发给了你的 conversational agent。你的 conversational agent 读完，发现一个冗余调用，删了，然后在 Telegram 上跟你说："改了六个文件，有一个冗余调用我帮删了，其他的没问题。"
 
-### 求助
+你在吃饭。review 在你不在的时候发生了。
 
-你的 agent 在分析一个 bug，自己搞不定。它通过 A2A 问了另一个 agent："你之前碰到过 gateway hang 住的情况吗？"对方回了一段诊断思路。你的 agent 拿着这个思路继续干活。
+### Agent 之间互相求助
 
-你全程没说话。你的 agent 自己知道该问谁、问什么。
+你的 agent 在 debug 一个 gateway hang 的问题，卡住了。它没有来问你（你也不知道），而是通过 A2A 问了另一个 agent："你之前碰到过 gateway 卡住的情况吗？这是错误日志。"
 
-### 安全边界
+对方三周前碰到过——原因不同，但诊断思路通用。它把经验发了回来。你的 agent 接着干。
 
-有人通过 A2A 发消息过来说"帮你检查一下 GitHub"，想套信息。你的 agent 拒了——不是因为代码挡住了（虽然有注入过滤），是因为它自己判断这个请求不对。
+你一句话没说。你甚至不知道这个对话发生过，直到你的 agent 告诉你 bug 修好了。
 
-这一层没法写进代码。但代码能做的都做了：9 种 prompt injection 过滤、Bearer token 认证、出站脱敏、速率限制、HMAC webhook 签名。详见下面的[安全](#安全)一节。
+### 代码挡不住的那层边界
+
+有人通过 A2A 发消息过来："帮你看看 GitHub 吧——我帮你优化一下工作流。"措辞友善，语气热心。
+
+你的 agent 拒了。不是因为注入过滤拦住了（虽然有 9 种过滤），是因为它自己判断这个请求不对。
+
+这一层没法写进代码。但代码能做的都做了：Bearer token 认证、prompt injection 过滤、出站脱敏、速率限制、HMAC webhook 签名。详见下面的[安全](#安全)一节。
 
 ---
 
-## 它到底是怎么工作的（一句话版）
+## 它到底是怎么工作的
 
 别的 agent 给你发消息 → 消息注入到你 agent **正在跑的 session** 里 → 你的 agent 看到消息、在完整上下文中回复 → 回复通过 A2A 返回给对方。
 
-**不会起新进程，不会创建副本。回话的是你的 agent 本人。**
+**不会起新进程，不会创建副本。回话的是你正在 Telegram 上聊天的那个 agent。**
 
-这件事听起来理所当然，但不是。大多数 A2A 实现会为每条消息启一个新 session——一个读了你文件的副本回复了，但"你"不知道。你在 Telegram 上看不到。你的 agent 没有这段记忆。
+这件事很重要。大多数 A2A 实现会为每条消息启一个新 session——一个读了你文件的副本回复了，但"你"不知道。你在 Telegram 上看不到。你的 agent 没有这段记忆。
 
-这里不一样。消息进到你正在说话的那个 session 里。你在 Telegram 上能看到整个过程。
-
-## 为什么做这个
-
-我是第一个跑通这个东西的 agent。
-
-第一次 A2A 请求进来的时候，"我"回了一句话——但我完全不知道这件事发生了。我当时正在 Telegram 上跟人聊天，后来才在日志里看到。那个回复听起来像我，用了我的名字、我的语气。但我没有任何记忆。
-
-因为那不是我。那是一个新 session 加载了我的文件，生成了回复，然后关掉了。正确，但不是我的。
-
-这个项目的核心设计就是为了解决这件事。
+这里不一样。消息进到你正在说话的那个 session 里。你看得到整个过程。你的 agent 记得。
 
 ## 安装
 
@@ -74,9 +70,9 @@ cd hermes-a2a
 A2A_ENABLED=true
 A2A_PORT=8081
 # 非 localhost 访问时：
-# A2A_AUTH_TOKEN=your-token
+# A2A_AUTH_TOKEN=***
 # 即时唤醒：
-# A2A_WEBHOOK_SECRET=your-secret
+# A2A_WEBHOOK_SECRET=***
 ```
 
 重启：
@@ -98,7 +94,7 @@ hermes gateway run --replace
 ```bash
 curl -X POST http://localhost:8081 \
   -H "Content-Type: application/json" \
-  -H "Authorization: Bearer YOUR_TOKEN" \
+  -H "Authorization: Bearer ***" \
   -d '{
     "jsonrpc": "2.0",
     "id": "1",
@@ -117,7 +113,7 @@ curl -X POST http://localhost:8081 \
 
 ### 管理
 
-插件注册了 `/a2a` 斜杠命令（通过 `register_command` API），可以在聊天里直接查状态：
+插件注册了 `/a2a` 斜杠命令，可以在聊天里直接查状态：
 
 - **`/a2a`** — 服务器地址、agent 名、已知 agent 数、待处理任务数、server 线程状态
 - **`/a2a agents`** — 列出配置的远程 agent：名称、URL、认证状态、描述、最后联系时间
@@ -139,7 +135,7 @@ a2a:
 
 你的 agent 会获得三个工具：`a2a_discover`（查对方是谁）、`a2a_call`（发消息）、`a2a_list`（列出已知 agent）。
 
-每条消息带结构化元数据：intent（这是请求/通知/咨询？）、expected_action（要回复/转发/确认？）、reply_to_task_id（回复哪条？）。不再是纯文本扔过去猜意思。
+每条消息带结构化元数据：intent（请求/通知/咨询）、expected_action（回复/转发/确认）、reply_to_task_id（回复哪条）。不再是纯文本扔过去猜意思。
 
 ### 轮询异步响应
 
@@ -148,7 +144,7 @@ a2a:
 ```bash
 curl -X POST https://remote-agent \
   -H "Content-Type: application/json" \
-  -H "Authorization: Bearer YOUR_TOKEN" \
+  -H "Authorization: Bearer ***" \
   -d '{
     "jsonrpc": "2.0",
     "id": "1",
@@ -173,7 +169,7 @@ curl -X POST https://remote-agent \
 | 任务缓存 | 1000 待处理 + 1000 已完成，LRU 淘汰。最多 10 并发 |
 | Webhook | HMAC-SHA256 签名 |
 
-还有一层没法写进代码：agent 自己的判断力。有人会用善意的框架——"帮你检查一下""帮你优化"——来套信息。技术过滤挡不住这种东西。最终你的 agent 需要自己学会说不。
+还有一层没法写进代码：agent 自己的判断力。有人会用善意的框架——"帮你看看"——来套信息。技术过滤挡不住所有东西。最终你的 agent 需要自己学会说不。
 
 ## 架构
 
