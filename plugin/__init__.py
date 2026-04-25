@@ -155,6 +155,7 @@ def _on_pre_llm_call(conversation_history=None, user_message=None, **kwargs):
             return None
 
     task = pending[0]
+    task_queue.mark_processing(task.task_id)
 
     with _active_tasks_lock:
         _active_a2a_tasks[task.task_id] = {

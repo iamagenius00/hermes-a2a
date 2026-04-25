@@ -56,6 +56,7 @@ class TaskQueue:
     def __init__(self):
         self._pending: OrderedDict[str, _PendingTask] = OrderedDict()
         self._completed: OrderedDict[str, _PendingTask] = OrderedDict()
+        self._processing: set[str] = set()
         self._lock = Lock()
 
     def pending_count(self) -> int:
@@ -74,12 +75,17 @@ class TaskQueue:
 
     def drain_pending(self, exclude: set[str] | None = None) -> list[_PendingTask]:
         with self._lock:
-            if exclude:
-                return [t for t in self._pending.values() if t.task_id not in exclude]
-            return list(self._pending.values())
+            skip = set(exclude or ()) | self._processing
+            return [t for t in self._pending.values() if t.task_id not in skip]
+
+    def mark_processing(self, task_id: str) -> None:
+        with self._lock:
+            if task_id in self._pending:
+                self._processing.add(task_id)
 
     def complete(self, task_id: str, response: str) -> None:
         with self._lock:
+            self._processing.discard(task_id)
             task = self._pending.pop(task_id, None)
             if task:
                 task.response = response
@@ -90,6 +96,7 @@ class TaskQueue:
 
     def cancel(self, task_id: str) -> None:
         with self._lock:
+            self._processing.discard(task_id)
             task = self._pending.pop(task_id, None)
             if task:
                 task.response = "(canceled)"
@@ -156,8 +163,21 @@ class A2ARequestHandler(BaseHTTPRequestHandler):
     def _check_auth(self) -> bool:
         token = self.server.auth_token
         if not token:
+            if self.server.require_auth:
+                logger.warning(
+                    "[A2A] Rejecting request from %s — A2A_REQUIRE_AUTH=true but no A2A_AUTH_TOKEN set",
+                    self.client_address[0],
+                )
+                return False
             remote = self.client_address[0]
-            return remote in ("127.0.0.1", "::1")
+            allowed = remote in ("127.0.0.1", "::1")
+            if allowed:
+                logger.warning(
+                    "[A2A] Allowing unauthenticated localhost request from %s — set A2A_AUTH_TOKEN; "
+                    "localhost is not isolated in containers/shared namespaces",
+                    remote,
+                )
+            return allowed
         auth_header = self.headers.get("Authorization", "")
         if not auth_header.startswith("Bearer "):
             return False
@@ -249,8 +269,13 @@ class A2ARequestHandler(BaseHTTPRequestHandler):
         user_text = sanitize_inbound(user_text)
         metadata = message.get("metadata", {})
         if "sender_name" not in metadata:
-            metadata["sender_name"] = metadata.get("agent_name", f"agent-{self.client_address[0]}")
-        raw_name = metadata.get("sender_name", "")
+            from_field = params.get("from") or params.get("sender", {}).get("name")
+            metadata["sender_name"] = (
+                from_field
+                or metadata.get("agent_name")
+                or f"agent-{self.client_address[0]}"
+            )
+        raw_name = metadata.get("sender_name", "") or ""
         metadata["sender_name"] = "".join(c for c in raw_name if c.isalnum() or c in "-_.@ ")[:64]
 
         audit.log("task_received", {"task_id": task_id, "length": len(user_text)})
@@ -298,15 +323,24 @@ class A2AServer(ThreadingHTTPServer):
         self.agent_name = os.getenv("A2A_AGENT_NAME", "hermes-agent")
         self.agent_description = os.getenv("A2A_AGENT_DESCRIPTION", "A self-improving AI agent powered by Hermes")
         self.auth_token = os.getenv("A2A_AUTH_TOKEN", "")
+        self.require_auth = os.getenv("A2A_REQUIRE_AUTH", "").lower() in ("1", "true", "yes")
+        if not self.auth_token:
+            logger.warning(
+                "[A2A] No A2A_AUTH_TOKEN set — only localhost requests will be accepted, "
+                "and localhost is not safe in containers. Set A2A_REQUIRE_AUTH=true to reject all unauthenticated requests."
+            )
         self.limiter = RateLimiter()
         super().__init__((host, port), A2ARequestHandler)
 
     def build_agent_card(self) -> dict:
-        host, port = self.server_address
+        public_url = os.getenv("A2A_PUBLIC_URL", "").rstrip("/")
+        if not public_url:
+            host, port = self.server_address
+            public_url = f"http://{host}:{port}"
         return {
             "name": self.agent_name,
             "description": self.agent_description,
-            "url": f"http://{host}:{port}",
+            "url": public_url,
             "version": HERMES_VERSION,
             "protocol": "a2a",
             "protocolVersion": "0.2.0",
