@@ -45,7 +45,7 @@ _summary_cache: dict[str, dict] = {}
 
 
 def _empty_meta() -> dict:
-    return {"hidden_tasks": {}, "pinned_agents": {}}
+    return {"hidden_tasks": {}, "pinned_agents": {}, "unread_agents": {}}
 
 
 def _load_meta() -> dict:
@@ -59,10 +59,13 @@ def _load_meta() -> dict:
         return _empty_meta()
     data.setdefault("hidden_tasks", {})
     data.setdefault("pinned_agents", {})
+    data.setdefault("unread_agents", {})
     if not isinstance(data["hidden_tasks"], dict):
         data["hidden_tasks"] = {}
     if not isinstance(data["pinned_agents"], dict):
         data["pinned_agents"] = {}
+    if not isinstance(data["unread_agents"], dict):
+        data["unread_agents"] = {}
     return data
 
 
@@ -82,6 +85,23 @@ def _filter_hidden_messages(agent_name: str, messages: list[dict], meta: dict) -
     if not hidden:
         return messages
     return [m for m in messages if m.get("task_id") not in hidden]
+
+
+def _all_task_ids(agent_name: str) -> list[str]:
+    safe_agent = _safe_name(agent_name)
+    agent_dir = _CONV_DIR / safe_agent
+    if not agent_dir.is_dir():
+        return []
+
+    task_ids: list[str] = []
+    seen: set[str] = set()
+    for filepath in sorted(agent_dir.glob("*.md")):
+        for msg in _parse_conversation_file(filepath):
+            task_id = msg.get("task_id")
+            if task_id and task_id not in seen:
+                seen.add(task_id)
+                task_ids.append(task_id)
+    return task_ids
 
 
 def _cleanup_meta(meta: dict, agents: dict[str, Path]) -> bool:
@@ -131,6 +151,15 @@ def _conversation_agents() -> dict[str, Path]:
 def _last_contact(agent_dir: Path) -> str | None:
     files = sorted(agent_dir.glob("*.md"), reverse=True)
     return files[0].stem if files else None
+
+
+def _last_visible_contact(agent_name: str, agent_dir: Path, meta: dict) -> str | None:
+    files = sorted(agent_dir.glob("*.md"), reverse=True)
+    for filepath in files:
+        messages = _filter_hidden_messages(agent_name, _parse_conversation_file(filepath), meta)
+        if messages:
+            return filepath.stem
+    return None
 
 
 async def _fetch_agent_card(url: str, auth_token: str = "") -> dict:
@@ -186,6 +215,7 @@ async def friends():
     if _cleanup_meta(meta, conv_dirs):
         _save_meta(meta)
     pinned = meta.get("pinned_agents", {})
+    unread = meta.get("unread_agents", {})
 
     config_by_safe = {}
     for a in configured:
@@ -193,6 +223,11 @@ async def friends():
         config_by_safe[sn] = a
 
     all_agents: dict[str, dict] = {}
+
+    visible_contacts = {
+        sn: _last_visible_contact(sn, d, meta)
+        for sn, d in conv_dirs.items()
+    }
 
     for a in configured:
         sn = _safe_name(a.get("name", ""))
@@ -203,13 +238,16 @@ async def friends():
             "description": a.get("description", ""),
             "has_auth": bool(a.get("auth_token")),
             "configured": True,
-            "contacted": sn in conv_dirs,
+            "contacted": bool(visible_contacts.get(sn)),
             "last_contact": None,
             "online": None,
             "avatar_url": a.get("avatar", ""),
         }
 
     for sn, d in conv_dirs.items():
+        visible_last = visible_contacts.get(sn)
+        if not visible_last and sn not in all_agents:
+            continue
         if sn not in all_agents:
             all_agents[sn] = {
                 "name": sn,
@@ -223,7 +261,7 @@ async def friends():
                 "online": None,
                 "avatar_url": "",
             }
-        all_agents[sn]["last_contact"] = _last_contact(d)
+        all_agents[sn]["last_contact"] = visible_last
 
     now = time.time()
     need_refresh = now - _health_cache_ts > _HEALTH_CACHE_TTL
@@ -264,6 +302,7 @@ async def friends():
             if cached.get("avatar_url") and not info["avatar_url"]:
                 info["avatar_url"] = cached["avatar_url"]
         info["pinned"] = bool(pinned.get(sn))
+        info["unread"] = bool(unread.get(sn))
 
     agents_list = sorted(
         all_agents.values(),
@@ -366,18 +405,20 @@ async def conversations(agent_name: str, days: int = 30):
     today = datetime.now(timezone.utc).date()
     result_days = []
     total = 0
+    latest_mtime = 0.0
 
     for i in range(days):
         date = today - timedelta(days=i)
         date_str = date.strftime("%Y-%m-%d")
         filepath = agent_dir / f"{date_str}.md"
         if filepath.exists():
+            latest_mtime = max(latest_mtime, filepath.stat().st_mtime)
             messages = _filter_hidden_messages(agent_name, _parse_conversation_file(filepath), meta)
             if messages:
                 result_days.append({"date": date_str, "messages": messages})
                 total += len(messages)
 
-    return {"agent": agent_name, "days": result_days, "total_messages": total}
+    return {"agent": agent_name, "days": result_days, "total_messages": total, "mtime": latest_mtime}
 
 
 @router.get("/conversations/{agent_name}/check")
@@ -385,20 +426,21 @@ async def check_new(agent_name: str, since: str = ""):
     agent_name = _safe_name(agent_name)
     agent_dir = _CONV_DIR / agent_name
     if not agent_dir.is_dir():
-        return {"new_messages": 0}
+        return {"new_messages": 0, "mtime": 0}
 
     today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
     filepath = agent_dir / f"{today}.md"
     if not filepath.exists():
-        return {"new_messages": 0}
+        return {"new_messages": 0, "mtime": 0}
 
     meta = _load_meta()
     messages = _filter_hidden_messages(agent_name, _parse_conversation_file(filepath), meta)
+    mtime = filepath.stat().st_mtime
     if not since:
-        return {"new_messages": 0, "latest": messages[-1]["timestamp"] if messages else ""}
+        return {"new_messages": 0, "latest": messages[-1]["timestamp"] if messages else "", "mtime": mtime}
 
     new_msgs = [m for m in messages if m["timestamp"] > since]
-    return {"new_messages": len(new_msgs), "messages": new_msgs}
+    return {"new_messages": len(new_msgs), "messages": new_msgs, "mtime": mtime}
 
 
 @router.post("/conversations/{agent_name}/hide")
@@ -426,6 +468,23 @@ async def hide_conversation_task(agent_name: str, data: dict):
     return {"agent": agent_name, "task_id": task_id, "hidden": hidden}
 
 
+@router.post("/conversations/{agent_name}/clear")
+async def clear_conversation_history(agent_name: str):
+    agent_name = _safe_name(agent_name)
+    task_ids = _all_task_ids(agent_name)
+
+    meta = _load_meta()
+    hidden_by_agent = meta.setdefault("hidden_tasks", {})
+    existing = hidden_by_agent.get(agent_name, [])
+    if not isinstance(existing, list):
+        existing = []
+
+    merged = list(dict.fromkeys(existing + task_ids))
+    hidden_by_agent[agent_name] = merged
+    _save_meta(meta)
+    return {"agent": agent_name, "hidden_count": len(task_ids)}
+
+
 @router.post("/friends/{agent_name}/pin")
 async def pin_friend(agent_name: str, data: dict):
     agent_name = _safe_name(agent_name)
@@ -439,6 +498,21 @@ async def pin_friend(agent_name: str, data: dict):
         pinned_agents.pop(agent_name, None)
     _save_meta(meta)
     return {"agent": agent_name, "pinned": pinned}
+
+
+@router.post("/friends/{agent_name}/unread")
+async def mark_friend_unread(agent_name: str, data: dict):
+    agent_name = _safe_name(agent_name)
+    unread = bool(data.get("unread", True))
+
+    meta = _load_meta()
+    unread_agents = meta.setdefault("unread_agents", {})
+    if unread:
+        unread_agents[agent_name] = True
+    else:
+        unread_agents.pop(agent_name, None)
+    _save_meta(meta)
+    return {"agent": agent_name, "unread": unread}
 
 
 def _get_dashboard_route() -> tuple[str, str]:

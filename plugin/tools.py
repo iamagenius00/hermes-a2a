@@ -11,7 +11,9 @@ from typing import Any, Dict, List
 
 logger = logging.getLogger(__name__)
 
-_DEFAULT_TIMEOUT = 30
+_DEFAULT_TIMEOUT = 120
+_POLL_INTERVAL = 5
+_POLL_MAX_ATTEMPTS = 60
 _MAX_RESPONSE_SIZE = 100_000
 _RATE_LIMIT_WINDOW = 60
 _RATE_LIMIT_MAX_CALLS = 30
@@ -48,7 +50,7 @@ def _http_request(method: str, url: str, json_body: dict = None, headers: dict =
     import urllib.request
     import urllib.error
 
-    req_headers = {"Content-Type": "application/json"}
+    req_headers = {"Content-Type": "application/json", "User-Agent": "Hermes-A2A/1.0"}
     if headers:
         req_headers.update(headers)
 
@@ -57,7 +59,10 @@ def _http_request(method: str, url: str, json_body: dict = None, headers: dict =
 
     try:
         with urllib.request.urlopen(req, timeout=_DEFAULT_TIMEOUT) as resp:
-            return json.loads(resp.read().decode())
+            data = resp.read(_MAX_RESPONSE_SIZE + 1)
+            if len(data) > _MAX_RESPONSE_SIZE:
+                raise RuntimeError(f"Response exceeds {_MAX_RESPONSE_SIZE} bytes")
+            return json.loads(data.decode())
     except urllib.error.HTTPError as e:
         raise RuntimeError(f"HTTP {e.code}") from e
     except urllib.error.URLError as e:
@@ -171,28 +176,87 @@ def handle_call(args: dict, **kwargs) -> str:
 
     audit.log("call_outbound", {"target": url, "task_id": task_id, "length": len(message)})
 
+    # Persist outbound message immediately so it's visible even before reply arrives
+    try:
+        from .persistence import save_exchange
+        agent_label = name or url.rstrip("/").rsplit("/", 1)[-1]
+        save_exchange(
+            agent_name=agent_label,
+            task_id=task_id,
+            inbound_text="(waiting for reply…)",
+            outbound_text=message,
+            metadata={"intent": intent, "reply_to_task_id": reply_to_task_id},
+            direction="outbound",
+        )
+    except Exception as exc:
+        logger.debug("Failed to persist initial outbound: %s", exc)
+
+    response_text = ""
+    task_state = "unknown"
+    error_msg = ""
+
     try:
         result = _http_request("POST", url.rstrip("/"), json_body=payload, headers=headers)
     except ConnectionError:
-        return _err(f"Cannot connect to {url}")
+        error_msg = f"Cannot connect to {url}"
     except TimeoutError:
-        return _err(f"Remote agent timed out after {_DEFAULT_TIMEOUT}s")
+        error_msg = f"Remote agent timed out after {_DEFAULT_TIMEOUT}s"
     except Exception as e:
-        return _err(f"Call failed: {e}")
+        error_msg = f"Call failed: {e}"
+    else:
+        rpc_error = result.get("error")
+        if rpc_error:
+            err_msg = rpc_error.get("message", str(rpc_error)) if isinstance(rpc_error, dict) else str(rpc_error)
+            error_msg = f"Remote agent error: {err_msg}"
+        else:
+            rpc_result = result.get("result", {})
+            task_state = rpc_result.get("status", {}).get("state", "unknown")
+            remote_task_id = rpc_result.get("id", task_id)
 
-    rpc_result = result.get("result", {})
-    task_state = rpc_result.get("status", {}).get("state", "unknown")
+            # If agent returned "working", poll tasks/get until completed
+            if task_state == "working" and remote_task_id:
+                poll_payload = {
+                    "jsonrpc": "2.0",
+                    "id": str(uuid.uuid4()),
+                    "method": "tasks/get",
+                    "params": {"id": remote_task_id},
+                }
+                for attempt in range(_POLL_MAX_ATTEMPTS):
+                    time.sleep(_POLL_INTERVAL)
+                    try:
+                        poll_result = _http_request("POST", url.rstrip("/"), json_body=poll_payload, headers=headers)
+                        poll_inner = poll_result.get("result", {})
+                        poll_state = poll_inner.get("status", {}).get("state", "")
+                        if poll_state in ("completed", "failed", "canceled"):
+                            rpc_result = poll_inner
+                            task_state = poll_state
+                            break
+                    except Exception:
+                        continue
 
-    response_text = ""
-    for artifact in rpc_result.get("artifacts", []):
-        for part in artifact.get("parts", []):
-            if part.get("type") == "text":
-                response_text += part.get("text", "") + "\n"
+            for artifact in rpc_result.get("artifacts", []):
+                for part in artifact.get("parts", []):
+                    if part.get("type") == "text":
+                        response_text += part.get("text", "") + "\n"
+            response_text = sanitize_inbound(response_text.strip())
 
-    # sanitize_inbound: strip prompt injection from what we received
-    response_text = sanitize_inbound(response_text.strip())
+    audit.log("call_inbound", {"source": url, "task_state": task_state, "task_id": task_id, "error": error_msg or None})
 
-    audit.log("call_inbound", {"source": url, "task_state": task_state, "task_id": task_id})
+    # Update the initial "waiting" entry with actual response
+    try:
+        from .persistence import update_exchange
+        agent_label = name or url.rstrip("/").rsplit("/", 1)[-1]
+        inbound = response_text or (f"(error: {error_msg})" if error_msg else "(no text response)")
+        update_exchange(
+            agent_name=agent_label,
+            task_id=task_id,
+            inbound_text=inbound,
+        )
+    except Exception as exc:
+        logger.debug("Failed to update outbound exchange: %s", exc)
+
+    if error_msg:
+        return _err(error_msg)
 
     return _ok({
         "task_id": rpc_result.get("id", task_id),

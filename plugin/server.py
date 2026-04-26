@@ -62,9 +62,11 @@ class TaskQueue:
         with self._lock:
             return len(self._pending)
 
-    def enqueue(self, task_id: str, text: str, metadata: dict) -> _PendingTask:
+    def enqueue(self, task_id: str, text: str, metadata: dict) -> _PendingTask | None:
         task = _PendingTask(task_id, text, metadata)
         with self._lock:
+            if task_id in self._pending:
+                return None
             self._pending[task_id] = task
             while len(self._pending) > _TASK_CACHE_MAX:
                 _, old = self._pending.popitem(last=False)
@@ -191,7 +193,22 @@ class A2ARequestHandler(BaseHTTPRequestHandler):
             )
             return
 
-        length = int(self.headers.get("Content-Length", 0))
+        try:
+            length = int(self.headers.get("Content-Length", 0))
+        except (ValueError, TypeError):
+            self._send_json(
+                {"jsonrpc": "2.0", "error": {"code": -32600, "message": "Invalid Content-Length"}, "id": None},
+                400,
+            )
+            return
+
+        if length <= 0 or length > 65536:
+            self._send_json(
+                {"jsonrpc": "2.0", "error": {"code": -32600, "message": f"Content-Length must be 1-65536, got {length}"}, "id": None},
+                413 if length > 65536 else 400,
+            )
+            return
+
         try:
             body = json.loads(self.rfile.read(length))
         except Exception:
@@ -263,6 +280,12 @@ class A2ARequestHandler(BaseHTTPRequestHandler):
             }
 
         task = task_queue.enqueue(task_id, user_text, metadata)
+        if task is None:
+            return {
+                "id": task_id,
+                "status": {"state": "failed"},
+                "artifacts": [{"parts": [{"type": "text", "text": "Task ID already in use"}], "index": 0}],
+            }
 
         threading.Thread(target=_trigger_webhook, daemon=True).start()
 

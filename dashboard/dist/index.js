@@ -177,13 +177,18 @@
     var f = props.friend;
     var active = props.active;
     var onClick = props.onClick;
+    var onContextMenu = props.onContextMenu;
 
     var statusClass = f.online === true ? "online" : f.online === false ? "offline" : "unknown";
     var desc = f.description || (f.configured ? f.url : "contacted via A2A");
 
     return h("div", {
-      className: "a2a-friend" + (active ? " active" : ""),
+      className: "a2a-friend" + (active ? " active" : "") + (f.unread ? " unread" : ""),
       onClick: onClick,
+      onContextMenu: function (e) {
+        e.preventDefault();
+        onContextMenu(f, e.clientX, e.clientY);
+      },
     },
       h(Avatar, { name: f.name, avatarUrl: f.avatar_url }),
       h("div", { className: "a2a-friend-info" },
@@ -191,6 +196,7 @@
         h("div", { className: "a2a-friend-desc" }, truncate(desc, 32))
       ),
       f.pinned && h("div", { className: "a2a-friend-pin", title: "Pinned" }, "Pin"),
+      f.unread && h("div", { className: "a2a-friend-unread", title: "Unread" }),
       h("div", { className: "a2a-status-dot " + statusClass })
     );
   }
@@ -199,6 +205,7 @@
     var friends = props.friends;
     var selected = props.selected;
     var onSelect = props.onSelect;
+    var onContextMenu = props.onContextMenu;
 
     var agents = friends.filter(function (f) { return f.configured && f.url; });
     var incoming = friends.filter(function (f) { return !f.configured || !f.url; });
@@ -210,6 +217,7 @@
           friend: f,
           active: selected === f.safe_name,
           onClick: function () { onSelect(f); },
+          onContextMenu: onContextMenu,
         });
       });
     }
@@ -315,6 +323,7 @@
     var summary = useState(""); var setSummary = summary[1]; summary = summary[0];
     var messagesEnd = useRef(null);
     var latestTs = useRef("");
+    var latestMtime = useRef(0);
     var pollRef = useRef(null);
     var pendingRef = useRef([]);
 
@@ -346,7 +355,9 @@
       var seen = [];
       (nextDays || []).forEach(function (day) {
         (day.messages || []).forEach(function (msg) {
-          if (msg.outbound) {
+          var inbound = (msg.inbound || "").trim();
+          var hasReply = inbound && inbound !== "(waiting for reply…)" && inbound !== "(waiting for reply...)";
+          if (msg.outbound && hasReply) {
             seen.push({ text: msg.outbound.trim(), ts: parseTs(msg.timestamp) });
           }
         });
@@ -373,6 +384,7 @@
           var nextDays = data.days || [];
           setDays(nextDays);
           reconcilePending(nextDays);
+          if (data.mtime) latestMtime.current = data.mtime;
           if (nextDays.length > 0) {
             var lastDay = nextDays[0];
             var lastMsg = lastDay.messages[lastDay.messages.length - 1];
@@ -398,13 +410,17 @@
       loadConversations();
 
       pollRef.current = setInterval(function () {
+        if (pendingRef.current.length > 0) {
+          loadConversations();
+          return;
+        }
         if (!latestTs.current) {
-          if (pendingRef.current.length > 0) loadConversations();
           return;
         }
         fetchJSON(API + "/conversations/" + friend.safe_name + "/check?since=" + encodeURIComponent(latestTs.current))
           .then(function (data) {
-            if (data.new_messages > 0) {
+            if (data.new_messages > 0 || (data.mtime && data.mtime !== latestMtime.current)) {
+              latestMtime.current = data.mtime || latestMtime.current;
               loadConversations();
             }
           })
@@ -608,6 +624,29 @@
         });
     }
 
+    function handleClearHistory() {
+      if (!window.confirm("Clear dashboard history for " + friend.name + "?")) return;
+      fetchJSON(API + "/conversations/" + friend.safe_name + "/clear", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({}),
+      })
+        .then(function (data) {
+          if (data.error) {
+            setSendError(data.error);
+            return;
+          }
+          setDays([]);
+          latestTs.current = "";
+          latestMtime.current = 0;
+          setPendingList([]);
+          onFriendUpdated(friend.safe_name, { contacted: false, last_contact: null, remove_if_unconfigured: true });
+        })
+        .catch(function () {
+          setSendError("Failed to clear history");
+        });
+    }
+
     var statusClass = friend.online === true ? "online" : friend.online === false ? "offline" : "unknown";
     var reversedDays = days.slice().reverse();
 
@@ -627,7 +666,12 @@
           className: "a2a-pin-btn" + (friend.pinned ? " active" : ""),
           onClick: handlePinToggle,
           title: friend.pinned ? "Unpin conversation" : "Pin conversation",
-        }, friend.pinned ? "Unpin" : "Pin to top")
+        }, friend.pinned ? "Unpin" : "Pin to top"),
+        h("button", {
+          className: "a2a-clear-history-btn",
+          onClick: handleClearHistory,
+          title: "Clear dashboard history for this agent",
+        }, "Clear history")
       ),
       h("div", { className: "a2a-messages" },
         loading && h("div", { className: "a2a-loading" }, "Loading conversations…"),
@@ -691,6 +735,7 @@
     var friends = useState([]); var setFriends = friends[1]; friends = friends[0];
     var selected = useState(null); var setSelected = selected[1]; selected = selected[0];
     var loading = useState(true); var setLoading = loading[1]; loading = loading[0];
+    var menuState = useState(null); var setMenu = menuState[1]; var menu = menuState[0];
 
     useEffect(function () {
       function loadFriends() {
@@ -720,26 +765,119 @@
       return h("div", { className: "a2a-loading" }, "Loading…");
     }
 
-    return h("div", { className: "a2a-container" },
+    function clearFriendHistory(friend) {
+      if (!friend || !friend.safe_name) return;
+      if (!window.confirm("Clear dashboard history for " + friend.name + "?")) return;
+      fetchJSON(API + "/conversations/" + friend.safe_name + "/clear", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({}),
+      })
+        .then(function (data) {
+          if (data.error) return;
+          if (selected === friend.safe_name && selectedFriend) {
+            setSelected(null);
+          }
+          setFriends(friends.reduce(function (acc, f) {
+            if (f.safe_name !== friend.safe_name) {
+              acc.push(f);
+            } else if (f.configured) {
+              acc.push(Object.assign({}, f, { contacted: false, last_contact: null }));
+            }
+            return acc;
+          }, []));
+        })
+        .catch(function () {});
+    }
+
+    function patchFriend(safeName, patch) {
+      var nextFriends = friends.reduce(function (acc, f) {
+        if (f.safe_name !== safeName) {
+          acc.push(f);
+          return acc;
+        }
+        if (patch.remove_if_unconfigured && !f.configured) {
+          return acc;
+        }
+        var next = Object.assign({}, f, patch);
+        delete next.remove_if_unconfigured;
+        acc.push(next);
+        return acc;
+      }, []);
+      nextFriends.sort(function (a, b) {
+        if (!!a.pinned !== !!b.pinned) return a.pinned ? -1 : 1;
+        return (b.last_contact || "").localeCompare(a.last_contact || "");
+      });
+      setFriends(nextFriends);
+    }
+
+    function setFriendPin(friend, pinned) {
+      fetchJSON(API + "/friends/" + friend.safe_name + "/pin", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ pinned: pinned }),
+      }).then(function (data) {
+        if (!data.error) patchFriend(friend.safe_name, { pinned: pinned });
+      }).catch(function () {});
+    }
+
+    function setFriendUnread(friend, unread) {
+      fetchJSON(API + "/friends/" + friend.safe_name + "/unread", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ unread: unread }),
+      }).then(function (data) {
+        if (!data.error) patchFriend(friend.safe_name, { unread: unread });
+      }).catch(function () {});
+    }
+
+    function closeMenu() {
+      setMenu(null);
+    }
+
+    return h("div", { className: "a2a-container", onClick: closeMenu },
       h(FriendsList, {
         friends: friends,
         selected: selected,
-        onSelect: function (f) { setSelected(f.safe_name); },
+        onSelect: function (f) {
+          setSelected(f.safe_name);
+          if (f.unread) setFriendUnread(f, false);
+        },
+        onContextMenu: function (f, x, y) {
+          setMenu({ friend: f, x: x, y: y });
+        },
       }),
+      menu && h("div", {
+        className: "a2a-context-menu",
+        style: { left: menu.x + "px", top: menu.y + "px" },
+        onClick: function (e) { e.stopPropagation(); },
+      },
+        h("button", {
+          onClick: function () {
+            setFriendPin(menu.friend, !menu.friend.pinned);
+            closeMenu();
+          },
+        }, menu.friend.pinned ? "Unpin" : "Pin to top"),
+        h("button", {
+          onClick: function () {
+            setFriendUnread(menu.friend, !menu.friend.unread);
+            closeMenu();
+          },
+        }, menu.friend.unread ? "Mark as read" : "Mark as unread"),
+        h("button", {
+          className: "danger",
+          onClick: function () {
+            var friend = menu.friend;
+            closeMenu();
+            clearFriendHistory(friend);
+          },
+        }, "Delete")
+      ),
       selectedFriend
         ? h(ChatView, {
             key: selectedFriend.safe_name,
             friend: selectedFriend,
-            onFriendUpdated: function (safeName, patch) {
-              var nextFriends = friends.map(function (f) {
-                return f.safe_name === safeName ? Object.assign({}, f, patch) : f;
-              });
-              nextFriends.sort(function (a, b) {
-                if (!!a.pinned !== !!b.pinned) return a.pinned ? -1 : 1;
-                return (b.last_contact || "").localeCompare(a.last_contact || "");
-              });
-              setFriends(nextFriends);
-            },
+            onFriendUpdated: patchFriend,
           })
         : h("div", { className: "a2a-chat" },
             h(EmptyState, { hasFriends: friends.length > 0 })
