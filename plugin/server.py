@@ -113,14 +113,17 @@ class TaskQueue:
 task_queue = TaskQueue()
 
 
-def _trigger_webhook():
+def _trigger_webhook(task_text: str = ""):
     """POST to the internal webhook to trigger an agent turn."""
     secret = os.getenv("A2A_WEBHOOK_SECRET", "")
     if not secret:
         return
 
     port = int(os.getenv("WEBHOOK_PORT", "8644"))
-    body = json.dumps({"event_type": "a2a_inbound"}).encode()
+    body = json.dumps({
+        "event_type": "a2a_inbound",
+        "text": task_text,  # Pass the actual message so gateway can inject it into session
+    }).encode()
     sig = "sha256=" + hmac.new(secret.encode(), body, hashlib.sha256).hexdigest()
 
     req = urllib.request.Request(
@@ -287,7 +290,7 @@ class A2ARequestHandler(BaseHTTPRequestHandler):
                 "artifacts": [{"parts": [{"type": "text", "text": "Task ID already in use"}], "index": 0}],
             }
 
-        threading.Thread(target=_trigger_webhook, daemon=True).start()
+        threading.Thread(target=_trigger_webhook, args=(user_text,), daemon=True).start()
 
         task.ready.wait(timeout=_RESPONSE_TIMEOUT)
 
