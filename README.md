@@ -91,6 +91,29 @@ A2A_PORT=8081
 # A2A_WEBHOOK_SECRET=***
 ```
 
+Add webhook route to `~/.hermes/config.yaml`:
+
+```yaml
+webhook:
+  routes:
+    a2a_trigger:
+      secret: "<generate-a-random-secret>"  # must match A2A_WEBHOOK_SECRET
+      deliver: telegram  # or discord, slack, etc.
+      deliver_extra:
+        chat_id: '<your-chat-id>'
+      prompt: '[A2A trigger]'
+      source:
+        platform: telegram
+        chat_type: dm
+        chat_id: '<your-chat-id>'
+        user_id: '<your-user-id>'
+        user_name: '<your-name>'
+```
+
+The `source` block is critical — it routes A2A messages into your **main chat session** instead of creating throwaway webhook sessions. Without it, the agent spawns an isolated session per message and loses all conversation context.
+
+The `deliver` + `deliver_extra` fields ensure the agent's reply gets sent to your chat, so you can see A2A conversations happening in real time.
+
 Restart:
 
 ```bash
@@ -209,9 +232,12 @@ Remote Agent                        Your Hermes Agent
      |-- A2A request (tasks/send) -------->| (plugin HTTP server :8081)
      |                                     |-- enqueue message
      |                                     |-- POST webhook → trigger agent turn
+     |                                     |-- gateway routes to main session
+     |                                     |   (via source override in config)
      |                                     |-- pre_llm_call injects message
-     |                                     |-- agent replies in full context
+     |                                     |-- agent replies with full context
      |                                     |-- post_llm_call captures response
+     |                                     |-- reply delivered to your chat
      |<-- A2A response (synchronous) ------| (within 120s timeout)
 ```
 
@@ -244,6 +270,7 @@ Modifies `gateway/config.py`, `gateway/run.py`, `hermes_cli/tools_config.py`, an
 - No streaming (A2A spec supports SSE, not yet implemented)
 - Agent Card skills are hardcoded
 - Privacy enforcement ultimately relies on agent judgment, not technical enforcement
+- Concurrent A2A messages and user messages on the same session are serialized (one turn at a time) — the agent won't interrupt your conversation, but A2A messages queue behind it
 
 ## License
 
