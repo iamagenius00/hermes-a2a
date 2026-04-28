@@ -293,6 +293,7 @@ def _on_pre_llm_call(conversation_history=None, user_message=None, **kwargs):
             return None
 
     task = pending[0]
+    task_queue.mark_processing(task.task_id)
 
     if user_message and f"task:{task.task_id}" in str(user_message):
         return None

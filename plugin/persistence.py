@@ -5,6 +5,7 @@ Format matches ~/inbox/conversations/{agent}/{date}.md for consistency.
 
 from __future__ import annotations
 
+import os
 from datetime import datetime, timezone
 from pathlib import Path
 from threading import Lock
@@ -51,10 +52,17 @@ def save_exchange(
     entry_lines.append("---")
     entry_lines.append("")
 
+    new_content = "\n".join(entry_lines)
+
     with _lock:
         directory.mkdir(parents=True, exist_ok=True)
-        with open(filepath, "a", encoding="utf-8") as f:
-            f.write("\n".join(entry_lines))
+        existing = filepath.read_text(encoding="utf-8") if filepath.exists() else ""
+        tmp_path = filepath.with_name(filepath.name + ".tmp")
+        with open(tmp_path, "w", encoding="utf-8") as f:
+            f.write(existing + new_content)
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(tmp_path, filepath)
 
     return filepath
 
